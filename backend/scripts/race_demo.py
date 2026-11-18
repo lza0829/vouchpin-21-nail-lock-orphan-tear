@@ -8,6 +8,8 @@ API POST /api/redeem）与钉扎 POST /api/redeem/seal 做并发交错，演示�
   场景 2  先打在途核销、再开钉 → 在途核销先成功为 open，随后被本批完整收纳
   场景 3  双入口同时写（不钉扎）→ 全部串行成功、无丢失无重复，可一次钉入
   场景 4  钉扎提交前故障（独立故障注入进程）→ 整笔回滚，事实仍 open，无批次残留
+  场景 5  锁释放后双入口核销 409 无残留、孤儿扫描为空、重复钉扎 409；
+          植入锁后孤儿 → 总览报未闭合 → 冲突桶消化后闭包恢复、原批不被篡改
 
 用法： python scripts/race_demo.py
 """
@@ -186,6 +188,61 @@ def main() -> None:
         assert not [b for b in batches4 if b["business_day"] == day4]
         assert all(f["status"] == "open" and f["batch_id"] is None for f in facts4)
         assert sc_after == 200
+
+        # ---------------- 场景 5：锁释放后写入交错 + 锁后孤儿扫描 + 冲突桶消化 ----------------
+        hr("场景 5  钉扎释放后再核销（409 无残留）→ 孤儿扫描为空 → 重复钉扎 409 → 植入孤儿并消化")
+        day5 = f"2084-05-{uuid.uuid4().int % 28 + 1:02d}"
+        _req("PUT", f"{base}/settings/day", {"business_day": day5})
+        redeem(base, day5, "S5-A", "page")
+        sc_s5, seal5 = _req("POST", f"{base}/redeem/seal", {"business_day": day5})
+        # 锁已释放：两个入口再核销都必须 409，且不留事件/事实
+        sc_p5, body_p5 = redeem(base, day5, "S5-LATE-PAGE", "page")
+        sc_x5, body_x5 = redeem(base, day5, "S5-LATE-API", "api")
+        _, orphans5 = _req("GET", f"{base}/redeem/orphans?business_day={day5}")
+        sc_seal_again, _ = _req("POST", f"{base}/redeem/seal", {"business_day": day5})
+        print(f"钉扎: HTTP {sc_s5}，批 #{seal5.get('batch_id')}；锁后双入口核销: {sc_p5}/{sc_x5}（均应 409）")
+        print(f"锁后孤儿扫描: orphan_open_count={orphans5.get('orphan_open_count')}（应 0）；"
+              f"重复钉扎: HTTP {sc_seal_again}（应 409）")
+        assert (sc_s5, sc_p5, sc_x5, sc_seal_again) == (200, 409, 409, 409)
+        assert orphans5["orphan_open_count"] == 0 and orphans5["facts"] == []
+        _, facts5 = _req("GET", f"{base}/facts?business_day={day5}")
+        assert all(f["status"] == "sealed" for f in facts5)
+        assert not {"S5-LATE-PAGE", "S5-LATE-API"} & {f["coupon_code"] for f in facts5}
+
+        # 直接在库内植入一行「锁期应拒却已落库」的孤儿，验证扫描/总览/消化闭环
+        import sqlite3
+        db_path = os.path.join(work, "main", "clipbond.db")
+        wconn = sqlite3.connect(db_path)
+        wconn.execute(
+            "INSERT INTO coupon_events(event_type, coupon_code, campaign_code, amount, business_day, occurred_at)"
+            " VALUES('redeem','S5-ORPHAN','NEW10',10,?,?)",
+            (day5, f"{day5}T23:00:00"),
+        )
+        eid = wconn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        wconn.execute(
+            "INSERT INTO redeem_facts(coupon_code, campaign_code, amount, business_day, event_id, status)"
+            " VALUES('S5-ORPHAN','NEW10',10,?,?,'open')",
+            (day5, eid),
+        )
+        wconn.commit()
+        wconn.close()
+        _, orphans5b = _req("GET", f"{base}/redeem/orphans?business_day={day5}")
+        _, dash5 = _req("GET", f"{base}/dashboard")  # 业务日已切到 day5
+        sc_q5, q5 = _req("POST", f"{base}/redeem/quarantine", {"business_day": day5})
+        _, facts5c = _req("GET", f"{base}/facts?business_day={day5}")
+        _, bd5 = _req("GET", f"{base}/batches/{seal5['batch_id']}")
+        print(f"植入孤儿后扫描: orphan_open_count={orphans5b.get('orphan_open_count')}（应 1），"
+              f"总览闭包对账 sealed_reconciles={dash5.get('sealed_reconciles')}（应 False）")
+        print(f"冲突桶消化: HTTP {sc_q5}，隔离 {q5.get('quarantined_count')} 笔；"
+              f"原批对账仍 matches={bd5['reconcile']['matches']}")
+        assert orphans5b["orphan_open_count"] == 1
+        assert dash5["sealed_reconciles"] is False and dash5["orphan_open_count"] == 1
+        assert sc_q5 == 200 and q5["quarantined_count"] == 1
+        orphan_row = next(f for f in facts5c if f["coupon_code"] == "S5-ORPHAN")
+        assert orphan_row["status"] == "conflict" and orphan_row["batch_id"] is None
+        assert bd5["reconcile"]["matches"] and all(f["coupon_code"] != "S5-ORPHAN" for f in bd5["detail"])
+        _, dash5b = _req("GET", f"{base}/dashboard")
+        assert dash5b["sealed_reconciles"] is True and dash5b["orphan_open_count"] == 0
 
         hr("全部断言通过：钉锁/双入口核销写/批头/批明细/日 sealed/总览已钉计数 同成同败，无游离回执")
     finally:

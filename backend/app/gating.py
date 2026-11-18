@@ -2,7 +2,7 @@
 
 每个业务日一把排他锁，钉扎事务与核销写事务（页面 /api/events 与 API /api/redeem
 两个入口共用同一服务函数、同一把锁）在进入 BEGIN IMMEDIATE 写事务前都必须先取得
-该业务日的写锁：
+该业务日的写锁，并且锁必须真正持有到临界区结束：
 
 * 钉扎持锁期间，新的核销写在闸外阻塞，拿不到锁就无法插入任何核销事实；
 * 钉扎提交释放锁后，核销写进入事务会读到日已 sealed，直接 409，不会产生
@@ -42,10 +42,17 @@ _DAY_LOCKS = _DayLocks()
 
 @contextmanager
 def day_write_lock(business_day: str) -> Iterator[None]:
-    """业务日写锁：钉扎与核销写在此互斥，锁随事务提交/回滚释放。"""
-    from app.services import lock_window
-    with lock_window.short_lease(business_day):
+    """业务日写锁：钉扎与核销写在此互斥，锁随事务提交/回滚释放。
+
+    必须真正持有到临界区结束——不得在 yield 前提前释放，否则第二个写者会在
+    钉扎事务进行中插入事实，制造「锁中写入成孤儿 / 锁后仍 open 可再预览」。
+    """
+    lock = _DAY_LOCKS.get(business_day)
+    lock.acquire()
+    try:
         yield
+    finally:
+        lock.release()
 
 
 def gate_pause(stage: str) -> None:

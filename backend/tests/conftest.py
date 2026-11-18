@@ -19,10 +19,11 @@ def client() -> TestClient:
 @pytest.fixture()
 def day(client: TestClient) -> str:
     # 每个用例独立业务日，互不污染；业务日锁按天分桶。
+    # 用大随机空间（约 9 千亿种组合）保证不与历史用例已 sealed 的日子相撞。
     import uuid
 
-    n = uuid.uuid4().int % 10_000_000
-    d = f"2099-{n % 12 + 1:02d}-{(n // 12) % 28 + 1:02d}"
+    n = int(uuid.uuid4().hex[:10], 16)
+    d = f"20{n % 100:02d}-{n // 100 % 12 + 1:02d}-{n // 1200 % 28 + 1:02d}"
     r = client.put("/api/settings/day", json={"business_day": d})
     assert r.status_code == 200, r.text
     return d

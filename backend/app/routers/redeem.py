@@ -22,9 +22,16 @@ def orphans(business_day: str | None = Query(None)):
     return {
         "business_day": data["business_day"],
         "already_sealed": data["already_sealed"],
-        "open_count": data["open_count"],
-        "facts": data["facts"],
+        # 仅日已 sealed 却仍 open 的行才算锁后孤儿；未钉日子的 open 是正常可钉事实。
+        "orphan_open_count": data["orphan_open_count"],
+        "facts": data["orphan_facts"],
+        "conflict_facts": data["conflict_facts"],
     }
+
+
+@router.post("/redeem/quarantine")
+def quarantine(body: dict):
+    return svc.quarantine_orphans(body)
 
 
 @router.post("/redeem/seal")

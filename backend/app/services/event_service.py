@@ -81,33 +81,10 @@ def _write_event(
 ) -> dict[str, Any]:
     conn = connect(immediate=True)
     try:
+        # 短窗无锁也认 sealed：即使业务日闸因任何原因未串行住（多进程/历史脏状态），
+        # 写事务内仍以库内 sealed 标记为准，在任何 INSERT 之前直接拒写回滚。
+        # 严禁先插事件/事实再抛 409——那会留下「应拒已落库且未进任何批」的游离行。
         if gated and fact_repo.day_is_sealed(conn, day):
-            amount = float(body.get("amount") or 0)
-            if et == REDEEM_EVENT_TYPE and amount <= 0:
-                camps = {c["code"]: c for c in camp_repo.list_all(conn)}
-                if camp in camps:
-                    amount = float(camps[camp]["face_value"])
-            occurred = body.get("occurred_at") or datetime.now().replace(microsecond=0).isoformat()
-            eid = event_repo.insert_event(
-                conn,
-                event_type=et,
-                coupon_code=code,
-                campaign_code=camp,
-                amount=amount,
-                business_day=day,
-                occurred_at=occurred,
-                note=body.get("note") or "",
-            )
-            fact_id = fact_repo.insert_fact(
-                conn,
-                coupon_code=code,
-                campaign_code=camp,
-                amount=amount,
-                business_day=day,
-                event_id=eid,
-                status="open",
-            )
-            conn.commit()
             raise HTTPException(409, f"业务日 {day} 已 sealed 钉扎，核销写入被写闸拒绝")
         amount = float(body.get("amount") or 0)
         if et == REDEEM_EVENT_TYPE and amount <= 0:

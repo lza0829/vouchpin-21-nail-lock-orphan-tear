@@ -26,6 +26,7 @@ export const api = {
   batches: () => req('/batches'),
   batchDetail: (id) => req(`/batches/${id}`),
   orphans: (day) => req('/redeem/orphans' + (day ? `?business_day=${encodeURIComponent(day)}` : '')),
+  quarantine: (body) => req('/redeem/quarantine', { method: 'POST', body: JSON.stringify(body || {}) }),
   getDay: () => req('/settings/day'),
   setDay: (business_day) => req('/settings/day', { method: 'PUT', body: JSON.stringify({ business_day }) }),
 }
